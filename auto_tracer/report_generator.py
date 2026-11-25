@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, List
 
-from .runner import compute_hop_map, load_frozen_edges, run_b1_heur_v3
+from .runner import compute_hop_map, load_frozen_edges, run_b1_heur_v3, run_b1_heur_v4, run_b1_heur_v5
 from .wash_loop import analyze_tx_net_flows
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -61,16 +61,21 @@ def build_report_markdown(
     breakpoints = [r for r in rows if r["status"] == "breakpoint"]
     filtered = [r for r in rows if r["status"] == "filtered"]
     attack_prep = [r for r in filtered if r.get("attack_prep_candidate")]
+    exploit_mints = [r for r in kept if r.get("exploit_mint_candidate")]
     filter_reasons = Counter(r.get("filter_reason", "unknown") for r in filtered)
 
     wash_keys = {tuple(x) for x in net_analysis["wash_edge_keys"]}
     non_wash_kept = [r for r in kept if (r["tx_hash"], r.get("log_index")) not in wash_keys]
+    engine_lbl = (
+        "B1-Heur-v5" if any(r.get("decision_engine") == "rule-v5" for r in rows)
+        else ("B1-Heur-v4" if any(r.get("decision_engine") == "rule-v4" for r in rows) else "B1-Heur-v3")
+    )
 
     lines: List[str] = []
     lines.append(f"# Vector (SG) — On-Chain Fund-Flow Forensics Report (`{lock['case_id']}`)")
     lines.append("")
     lines.append(f"> **Case Name**: {lock['case_name']}  ")
-    lines.append(f"> **Chain**: `{lock.get('chain', 'bsc').upper()}` · **Generated**: `{now_utc}` · **Engine**: `auto-tracer v0.2 (B1-Heur-v3 + Wash-Loop Net-Flow Collapser)`  ")
+    lines.append(f"> **Chain**: `{lock.get('chain', 'bsc').upper()}` · **Generated**: `{now_utc}` · **Engine**: `auto-tracer v0.3 ({engine_lbl} + Wash-Loop Net-Flow Collapser)`  ")
     lines.append(f"> **Frozen Snapshot Lock (`FREEZE_LOCK.json` SHA-256)**: `{lock_sha}`  ")
     lines.append("> **Mandatory Operating Boundaries**: Vector (SG) is strictly **non-custodial**, never requests private keys, is **not a law firm** (output does not constitute legal advice), and makes **no guarantee of asset freeze or recovery**. Every record below separates observed on-chain facts from analytical signals and unconfirmed breakpoints.")
     lines.append("")
@@ -82,7 +87,7 @@ def build_report_markdown(
     lines.append("| :--- | :--- | :--- |")
     lines.append(f"| Frozen Transactions Analyzed | `{lock['artifacts']['window_transactions.jsonl']['count']}` | Snapshot SHA-256: `{lock['artifacts']['window_transactions.jsonl']['sha256'][:16]}...` |")
     lines.append(f"| Total Decoded Transfer Edges | `{len(rows)}` | Native + deterministic ERC-20 `Transfer` logs |")
-    lines.append(f"| Primary Economic Edges Retained | `{len(kept)}` (`{len(non_wash_kept)}` non-wash-loop) | `{net_analysis['total_wash_loop_edges_flagged']}` intra-tx wash-loop edges flagged (never deleted) |")
+    lines.append(f"| Primary Economic Edges Retained | `{len(kept)}` (`{len(non_wash_kept)}` non-wash-loop; `{len(exploit_mints)}` root-cause mints) | `{net_analysis['total_wash_loop_edges_flagged']}` intra-tx wash-loop edges flagged (never deleted) |")
     lines.append(f"| Filtered Non-Economic / Prep Edges | `{len(filtered)}` (`{len(attack_prep)}` attacker-initiated micro-prep) | **100% raw records & filter reasons retained** |")
     lines.append(f"| Known Mixer / Bridge Breakpoints | `{len(breakpoints)}` | Explicitly stopped; zero fabricated continuity |")
     lines.append("| Invalid Citations / Conservation Violations | `0` | Deterministic receipt-bound extraction |")
@@ -302,6 +307,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate productized Vector (SG) BNB Chain forensic report bundle.")
     parser.add_argument("--case-dir", required=True, help="Frozen case directory (e.g. benchmarks/cases/BLIND-001)")
     parser.add_argument("--out-dir", help="Output directory (defaults to <case-dir>/report)")
+    parser.add_argument("--engine", choices=["v3", "v4", "v5"], default="v5", help="Heuristic baseline version (default: v5)")
     args = parser.parse_args()
 
     snap_dir = os.path.join(args.case_dir, "frozen_snapshot")
@@ -313,7 +319,8 @@ def main():
 
     lock, seed_addrs, edges = load_frozen_edges(snap_dir, chain="bsc")
     hops = compute_hop_map(seed_addrs, edges)
-    rows = run_b1_heur_v3(seed_addrs, edges, hops, chain=lock.get("chain", "bsc"))
+    runner_fn = {"v3": run_b1_heur_v3, "v4": run_b1_heur_v4, "v5": run_b1_heur_v5}[args.engine]
+    rows = runner_fn(seed_addrs, edges, hops, chain=lock.get("chain", "bsc"))
     net_analysis = analyze_tx_net_flows(rows)
 
     md_text = build_report_markdown(lock, lock_sha, rows, net_analysis)

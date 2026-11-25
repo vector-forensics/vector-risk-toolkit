@@ -18,6 +18,8 @@ import sys
 import tempfile
 
 from auto_tracer.label_store import VectorLabelStore
+from auto_tracer.models import ZERO_ADDR, TransferEdge
+from auto_tracer.runner import compute_hop_map, run_b1_heur_v5
 from risk_api.engine import VectorRiskEngine
 from team_triage.signals import evaluate_triage_snapshot
 
@@ -142,7 +144,35 @@ def main() -> None:
             proc.stdin.close()
             proc.wait(timeout=5)
 
-        print("ALL PUBLIC TOOLKIT CHECKS PASSED (Risk API + Track B + MCP/x402)")
+        # 4. B1-Heur-v5 root-cause & role-separated macro mint preservation vs. micro-mint pruning check
+        seed = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        secondary = "0xcccccccccccccccccccccccccccccccccccccccc"
+        edges = [
+            TransferEdge(
+                from_addr=ZERO_ADDR, to_addr=seed, asset="0xtoken1", symbol=None,
+                amount_raw=55_600_000_000 * 10**18, decimals=18, tx_hash="0xmint1",
+                block=100, log_index=0, chain="bsc", source="receipt_erc20_transfer",
+                tx_initiator=seed, value_usd=None,
+            ),
+            TransferEdge(
+                from_addr=ZERO_ADDR, to_addr=secondary, asset="0xtoken2", symbol=None,
+                amount_raw=27_814_200_000 * 10**18, decimals=18, tx_hash="0xmint_role_sep",
+                block=101, log_index=0, chain="bsc", source="receipt_erc20_transfer",
+                tx_initiator=seed, value_usd=None,
+            ),
+            TransferEdge(
+                from_addr=ZERO_ADDR, to_addr="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                asset="0xbookkeep", symbol=None, amount_raw=10**17, decimals=18,
+                tx_hash="0xmint2", block=102, log_index=1, chain="bsc",
+                source="receipt_erc20_transfer", tx_initiator=seed, value_usd=None,
+            ),
+        ]
+        v5_rows = run_b1_heur_v5({seed}, edges, compute_hop_map({seed}, edges), chain="bsc")
+        assert v5_rows[0]["status"] == "kept" and v5_rows[0].get("exploit_mint_candidate") is True
+        assert v5_rows[1]["status"] == "kept" and v5_rows[1].get("exploit_mint_candidate") is True
+        assert v5_rows[2]["status"] == "filtered" and v5_rows[2]["raw_tx_retained"] is True
+
+        print("ALL PUBLIC TOOLKIT CHECKS PASSED (B1-Heur-v5 + Risk API + Track B + MCP/x402)")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -361,6 +361,300 @@ def run_b1_heur_v3(
     return records
 
 
+def run_b1_heur_v4(
+    seed_addrs: Set[str], edges: List[TransferEdge], hops: Dict[str, int], chain: str = "bsc"
+) -> List[dict]:
+    """B1-Heur-v4 (Engineering Crystallization from BLIND-003 -> strictly evaluated on BLIND-004+):
+    Fixes the BLIND-003 False-Deletion failure (8.3% on Ankr aBNBc infinite mint) where generic
+    `zero_address_mint_or_burn` pruned root-cause unbacked mints while keeping routine bookkeeping
+    mints/burns filtered:
+      - Preserves a zero-address mint (`from == 0x0`, `to != 0x0`) initiated by a tracked seed
+        (`initiator_is_seed=True`) when EITHER:
+          (a) Direct seed mint of material scale: `to in seed_addrs` and (`amount_human >= 1.0`
+              or `value_usd >= 10.0`), OR
+          (b) Economically active minted asset: `(to, asset)` is subsequently transferred out
+              elsewhere in the snapshot (`amount_raw > 0`) and (`amount_human >= 10.0` or
+              `value_usd >= 10.0`).
+      - Tags preserved root-cause mints with `exploit_mint_candidate=True` and
+        `decision_rationale="seed_initiated_material_mint"`.
+      - Retains all B1-Heur-v3 guardrails (spoof/zero-width filtering, attacker micro-prep split,
+        bidirectional mixer/bridge breakpoint detection, 100% raw audit retention).
+    """
+    engine = RuleDecisionEngine()
+    # Pre-index assets actually transferred/disposed out by each address (conservation signal)
+    spent_assets_by_addr: Set[tuple] = {
+        (e.from_addr, e.asset)
+        for e in edges
+        if e.amount_raw > 0 and e.from_addr != ZERO_ADDR
+    }
+
+    records = []
+    for e in edges:
+        hop = min(hops.get(e.from_addr, 99), hops.get(e.to_addr, 99)) + 1
+        is_seed_init = e.tx_initiator in seed_addrs
+        base = {
+            "tx_hash": e.tx_hash,
+            "block": e.block,
+            "log_index": e.log_index,
+            "from": e.from_addr,
+            "to": e.to_addr,
+            "asset": e.asset,
+            "symbol": e.symbol,
+            "amount_raw": str(e.amount_raw),
+            "value_usd": round(e.value_usd, 4) if e.value_usd is not None else None,
+            "hop": hop,
+            "initiator_is_seed": is_seed_init,
+            "citation_valid": True,
+            "asset_conservation_ok": True,
+        }
+
+        if e.amount_raw == 0:
+            base.update({
+                "status": "filtered",
+                "raw_tx_retained": True,
+                "filter_reason": "zero_value_transfer",
+            })
+            records.append(base)
+            continue
+
+        spoof = is_spoof_or_scam_symbol(e.asset, e.symbol, chain=chain)
+        if spoof:
+            base.update({
+                "status": "filtered",
+                "raw_tx_retained": True,
+                "filter_reason": spoof,
+            })
+            records.append(base)
+            continue
+
+        bp = breakpoint_reason(e.to_addr) or breakpoint_reason(e.from_addr)
+        if bp:
+            base.update({"status": "breakpoint", "breakpoint_reason": bp})
+            records.append(base)
+            continue
+
+        # B1-Heur-v4: Preserve material seed-initiated root-cause mints (BLIND-003 crystallization)
+        if e.from_addr == ZERO_ADDR and e.to_addr != ZERO_ADDR and is_seed_init:
+            direct_seed_mint = (
+                e.to_addr in seed_addrs
+                and (
+                    (e.value_usd is not None and e.value_usd >= 10.0)
+                    or e.amount_human >= 1.0
+                )
+            )
+            spent_material_mint = (
+                (e.to_addr, e.asset) in spent_assets_by_addr
+                and (
+                    (e.value_usd is not None and e.value_usd >= 10.0)
+                    or e.amount_human >= 10.0
+                )
+            )
+            if direct_seed_mint or spent_material_mint:
+                base.update({
+                    "status": "kept",
+                    "exploit_mint_candidate": True,
+                    "decision_engine": "rule-v4",
+                    "decision_rationale": "seed_initiated_material_mint",
+                    "decision_confidence": 0.95,
+                })
+                records.append(base)
+                continue
+
+        state = HopState(
+            from_addr=e.from_addr,
+            to_addr=e.to_addr,
+            symbol=e.symbol,
+            amount=e.amount_human,
+            depth=max(0, hop - 1),
+            direction="forward",
+            zero_from=(e.from_addr == ZERO_ADDR),
+            zero_to=(e.to_addr == ZERO_ADDR),
+            is_integer_amount=float(e.amount_human).is_integer(),
+            value_usd=e.value_usd,
+        )
+        dec = engine.decide(state)
+        base["decision_engine"] = "rule-v4"
+        base["decision_rationale"] = dec.rationale
+        base["decision_confidence"] = dec.confidence
+
+        if dec.action == HopAction.PRUNE:
+            if dec.rationale.startswith("below_dust_threshold"):
+                if is_seed_init:
+                    base.update({
+                        "status": "filtered",
+                        "raw_tx_retained": True,
+                        "attack_prep_candidate": True,
+                        "filter_reason": f"attacker_initiated_micro_prep:{dec.rationale}",
+                    })
+                else:
+                    base.update({
+                        "status": "filtered",
+                        "raw_tx_retained": True,
+                        "attack_prep_candidate": False,
+                        "filter_reason": f"third_party_dust_or_poisoning:{dec.rationale}",
+                    })
+            else:
+                base.update({
+                    "status": "filtered",
+                    "raw_tx_retained": True,
+                    "filter_reason": f"heuristic_prune:{dec.rationale}",
+                })
+        else:
+            base["status"] = "kept"
+        records.append(base)
+    return records
+
+
+def run_b1_heur_v5(
+    seed_addrs: Set[str], edges: List[TransferEdge], hops: Dict[str, int], chain: str = "bsc"
+) -> List[dict]:
+    """B1-Heur-v5 (Engineering Crystallization from BLIND-004 -> strictly evaluated on BLIND-005+):
+    Fixes the BLIND-004 role-separated mint failure (pNetwork pGALA 27.8B mint where tx initiator
+    `tx.from` != mint beneficiary `to`, causing B1-Heur-v4 to prune when `to` was outside initial
+    seed_addrs and off-window swaps were unseen):
+      - Preserves ANY seed-initiated zero-address mint (`from == 0x0`, `to != 0x0`,
+        `initiator_is_seed=True`) if:
+          (a) Direct seed mint of material scale: `to in seed_addrs` and (`amount_human >= 1.0`
+              or `value_usd >= 10.0`), OR
+          (b) Economically active minted asset: `(to, asset)` is transferred out elsewhere in
+              the snapshot (`amount_raw > 0`) and (`amount_human >= 10.0` or `value_usd >= 10.0`), OR
+          (c) Role-separated macro supply creation: `amount_human >= 1_000.0` or `value_usd >= 10_000.0`
+              (preserves privileged/exploit mints to secondary wallets while still pruning sub-1000
+              internal accounting/loyalty mints such as Level Finance's 0.132-token loop noise).
+    """
+    engine = RuleDecisionEngine()
+    spent_assets_by_addr: Set[tuple] = {
+        (e.from_addr, e.asset)
+        for e in edges
+        if e.amount_raw > 0 and e.from_addr != ZERO_ADDR
+    }
+
+    records = []
+    for e in edges:
+        hop = min(hops.get(e.from_addr, 99), hops.get(e.to_addr, 99)) + 1
+        is_seed_init = e.tx_initiator in seed_addrs
+        base = {
+            "tx_hash": e.tx_hash,
+            "block": e.block,
+            "log_index": e.log_index,
+            "from": e.from_addr,
+            "to": e.to_addr,
+            "asset": e.asset,
+            "symbol": e.symbol,
+            "amount_raw": str(e.amount_raw),
+            "value_usd": round(e.value_usd, 4) if e.value_usd is not None else None,
+            "hop": hop,
+            "initiator_is_seed": is_seed_init,
+            "citation_valid": True,
+            "asset_conservation_ok": True,
+        }
+
+        if e.amount_raw == 0:
+            base.update({
+                "status": "filtered",
+                "raw_tx_retained": True,
+                "filter_reason": "zero_value_transfer",
+            })
+            records.append(base)
+            continue
+
+        spoof = is_spoof_or_scam_symbol(e.asset, e.symbol, chain=chain)
+        if spoof:
+            base.update({
+                "status": "filtered",
+                "raw_tx_retained": True,
+                "filter_reason": spoof,
+            })
+            records.append(base)
+            continue
+
+        bp = breakpoint_reason(e.to_addr) or breakpoint_reason(e.from_addr)
+        if bp:
+            base.update({"status": "breakpoint", "breakpoint_reason": bp})
+            records.append(base)
+            continue
+
+        # B1-Heur-v5: Preserve seed-initiated material or role-separated macro mints
+        if e.from_addr == ZERO_ADDR and e.to_addr != ZERO_ADDR and is_seed_init:
+            direct_seed_mint = (
+                e.to_addr in seed_addrs
+                and (
+                    (e.value_usd is not None and e.value_usd >= 10.0)
+                    or e.amount_human >= 1.0
+                )
+            )
+            spent_material_mint = (
+                (e.to_addr, e.asset) in spent_assets_by_addr
+                and (
+                    (e.value_usd is not None and e.value_usd >= 10.0)
+                    or e.amount_human >= 10.0
+                )
+            )
+            role_separated_macro_mint = (
+                (e.value_usd is not None and e.value_usd >= 10_000.0)
+                or e.amount_human >= 1_000.0
+            )
+            if direct_seed_mint or spent_material_mint or role_separated_macro_mint:
+                rationale = (
+                    "seed_initiated_material_mint"
+                    if (direct_seed_mint or spent_material_mint)
+                    else "seed_initiated_role_separated_macro_mint"
+                )
+                base.update({
+                    "status": "kept",
+                    "exploit_mint_candidate": True,
+                    "decision_engine": "rule-v5",
+                    "decision_rationale": rationale,
+                    "decision_confidence": 0.95,
+                })
+                records.append(base)
+                continue
+
+        state = HopState(
+            from_addr=e.from_addr,
+            to_addr=e.to_addr,
+            symbol=e.symbol,
+            amount=e.amount_human,
+            depth=max(0, hop - 1),
+            direction="forward",
+            zero_from=(e.from_addr == ZERO_ADDR),
+            zero_to=(e.to_addr == ZERO_ADDR),
+            is_integer_amount=float(e.amount_human).is_integer(),
+            value_usd=e.value_usd,
+        )
+        dec = engine.decide(state)
+        base["decision_engine"] = "rule-v5"
+        base["decision_rationale"] = dec.rationale
+        base["decision_confidence"] = dec.confidence
+
+        if dec.action == HopAction.PRUNE:
+            if dec.rationale.startswith("below_dust_threshold"):
+                if is_seed_init:
+                    base.update({
+                        "status": "filtered",
+                        "raw_tx_retained": True,
+                        "attack_prep_candidate": True,
+                        "filter_reason": f"attacker_initiated_micro_prep:{dec.rationale}",
+                    })
+                else:
+                    base.update({
+                        "status": "filtered",
+                        "raw_tx_retained": True,
+                        "attack_prep_candidate": False,
+                        "filter_reason": f"third_party_dust_or_poisoning:{dec.rationale}",
+                    })
+            else:
+                base.update({
+                    "status": "filtered",
+                    "raw_tx_retained": True,
+                    "filter_reason": f"heuristic_prune:{dec.rationale}",
+                })
+        else:
+            base["status"] = "kept"
+        records.append(base)
+    return records
+
+
 def write_jsonl(path: str, rows: List[dict]) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -400,6 +694,18 @@ def main():
     b3_path = os.path.join(runs_dir, "B1-Heur-v3.jsonl")
     b3_sha = write_jsonl(b3_path, b3_rows)
 
+    t4 = time.perf_counter()
+    b4_rows = run_b1_heur_v4(seed_addrs, edges, hops, chain=lock.get("chain", "bsc"))
+    t_b4 = (time.perf_counter() - t4) * 1000.0
+    b4_path = os.path.join(runs_dir, "B1-Heur-v4.jsonl")
+    b4_sha = write_jsonl(b4_path, b4_rows)
+
+    t5 = time.perf_counter()
+    b5_rows = run_b1_heur_v5(seed_addrs, edges, hops, chain=lock.get("chain", "bsc"))
+    t_b5 = (time.perf_counter() - t5) * 1000.0
+    b5_path = os.path.join(runs_dir, "B1-Heur-v5.jsonl")
+    b5_sha = write_jsonl(b5_path, b5_rows)
+
     def summarize(rows):
         counts = {}
         for r in rows:
@@ -411,6 +717,8 @@ def main():
     print(f"B0-Rule    : {summarize(b0_rows)} | runtime={t_b0:.2f} ms | sha256={b0_sha}")
     print(f"B1-Heur-v2 : {summarize(b1_rows)} | runtime={t_b1:.2f} ms | sha256={b1_sha}")
     print(f"B1-Heur-v3 : {summarize(b3_rows)} | runtime={t_b3:.2f} ms | sha256={b3_sha}")
+    print(f"B1-Heur-v4 : {summarize(b4_rows)} | runtime={t_b4:.2f} ms | sha256={b4_sha}")
+    print(f"B1-Heur-v5 : {summarize(b5_rows)} | runtime={t_b5:.2f} ms | sha256={b5_sha}")
     print(f"Outputs written to: {runs_dir}")
 
 
