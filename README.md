@@ -15,8 +15,8 @@ This open-source repository bundles Vector (SG)'s pure-stdlib Python 3.9+ determ
 
 | Module | Purpose |
 | :--- | :--- |
-| `auto_tracer/` | Deterministic EVM/BSC transfer decoder, spoofed/zero-width token filter, intra-tx flash-loan & wash-swap net-flow collapser (`wash_loop.py`), grade-isolated SQLite label store (`label_store.py`), and 1-command forensic report bundler (`report_generator.py`). |
-| `risk_api/` | Explainable Narrow-Wedge Risk API v1.0 (`ThreadingHTTPServer`): address & transfer screening, Shadow Mode telemetry (`/v1/shadow/summary`), and formal false-positive Appeal/Revocation loop (`/v1/appeals`). |
+| `auto_tracer/` | Deterministic EVM/BSC transfer decoder (`B1-Heur-v5`), spoofed/zero-width token filter, intra-tx flash-loan & wash-swap net-flow collapser (`wash_loop.py`), grade-isolated SQLite label store (`label_store.py`), official OFAC/LE sync (`label_sync.py`), anti-false-merge entity clustering baseline (`entity_cluster.py`), and 1-command forensic report bundler (`report_generator.py`). |
+| `risk_api/` | Explainable Narrow-Wedge Risk API v1.0 (`ThreadingHTTPServer`): address & transfer screening, Tier-2 BSC hotspot stream cache (`stream_cache.py`), Shadow Mode telemetry (`/v1/shadow/summary`), and formal false-positive Appeal/Revocation loop (`/v1/appeals`). |
 | `team_triage/` | Public-signal Team & Entity Risk-Signal Triage CLI (`github-team-signals` v1.0): 18 configurable public GitHub API signals + exact-match Grade-A OFAC screening, paired with benign counter-hypotheses and zero raw email PII output. |
 | `mcp_preflight_demo/` | Lightweight **MCP Server (JSON-RPC 2.0 over `stdio`)** & **`x402` Pre-Flight Risk Check Demo** wrapping `VectorRiskEngine` for autonomous agent wallets (`execution_authority: "CLIENT_ONLY"`). |
 | `shadow_pilot_kit/` | Non-blocking, fail-open Python client (`shadow_client.py`) and `curl` quickstart for 30-day zero-disruption Shadow Mode pilots. |

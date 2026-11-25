@@ -21,6 +21,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from auto_tracer.forensics import (
+    KNOWN_DEX_ROUTERS_BSC,
     breakpoint_reason,
     canonical_token_info,
     estimate_usd,
@@ -29,6 +30,7 @@ from auto_tracer.forensics import (
 from auto_tracer.label_store import VectorLabelStore
 from auto_tracer.models import ZERO_ADDR
 from . import ENGINE_RULE_VERSION
+from .stream_cache import HotspotCacheStore
 
 SUPPORTED_CHAINS = ("bsc", "ethereum", "polygon", "arbitrum", "optimism", "avalanche", "tron", "bitcoin")
 HUB_NEUTRAL_CATEGORIES = {"dex_router", "bridge", "cex_hot", "cex_deposit", "benign_contract"}
@@ -56,22 +58,31 @@ def classify_shadow_lift(baseline_verdict: str, vector_risk_level: str) -> str:
 
 
 class VectorRiskEngine:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, cache_db_path: Optional[str] = None):
         self.store = VectorLabelStore(db_path)
         self.db_path = db_path
+        self.hotspot_cache = HotspotCacheStore(cache_db_path) if cache_db_path else None
 
     def close(self) -> None:
         self.store.close()
+        if self.hotspot_cache:
+            self.hotspot_cache.close()
 
     def coverage_declaration(self, chain: str) -> Dict[str, Any]:
         c = (chain or "").strip().lower()
+        cache_meta = self.hotspot_cache.get_meta() if self.hotspot_cache else None
         return {
             "engine_version": ENGINE_RULE_VERSION,
             "requested_chain": c,
             "chain_supported": c in SUPPORTED_CHAINS,
             "supported_chains": list(SUPPORTED_CHAINS),
             "label_isolation_spec": "label_spec_v1.0",
-            "data_mode": "local_frozen_label_store_plus_deterministic_rules",
+            "data_mode": (
+                "tier2_hotspot_cache_plus_isolated_label_store"
+                if self.hotspot_cache
+                else "local_frozen_label_store_plus_deterministic_rules"
+            ),
+            "hotspot_cache_tip_block": int(cache_meta["last_indexed_block"]) if (cache_meta and "last_indexed_block" in cache_meta) else None,
             "fallback_policy": "Returns UNABLE_TO_ASSESS on missing evidence; never fabricates risk or auto-blocks.",
             "execution_authority": "CLIENT_ONLY",
         }
@@ -119,7 +130,7 @@ class VectorRiskEngine:
                     "note": "Cross-chain bridge breakpoint; downstream legs require destination-chain verification.",
                 })
 
-        # 2. Canonical token check
+        # 2. Canonical token & built-in DEX router check
         canon = canonical_token_info(addr, chain=c)
         if canon:
             has_any_evidence = True
@@ -129,6 +140,14 @@ class VectorRiskEngine:
                 "symbol": canon[0],
                 "decimals": canon[1],
                 "confidence": 0.99,
+            })
+        elif c == "bsc" and addr.lower() in KNOWN_DEX_ROUTERS_BSC:
+            has_any_evidence = True
+            observed_facts.append({
+                "grade": "Grade-C",
+                "type": "KNOWN_DEX_ROUTER",
+                "label": KNOWN_DEX_ROUTERS_BSC[addr.lower()],
+                "confidence": 0.95,
             })
 
         # 3. Physically grade-isolated label store lookup (NEVER reads QUARANTINE)
@@ -209,6 +228,32 @@ class VectorRiskEngine:
                 "status": r["status"],
                 "under_appeal": is_disputed,
             })
+
+        # 4. Optional Tier-2 Hotspot Stream Cache lookup (recent mixer/bridge touch enrichment)
+        if self.hotspot_cache and addr:
+            hc = self.hotspot_cache.lookup_address(c, addr)
+            if hc:
+                if hc["mixer_touch_count"] > 0:
+                    has_any_evidence = True
+                    score = max(score, 65)
+                    analytical_signals.append({
+                        "grade": "Grade-D",
+                        "type": "HOTSPOT_CACHE_RECENT_MIXER_TOUCH",
+                        "mixer_touch_count": hc["mixer_touch_count"],
+                        "last_seen_block": hc["last_seen_block"],
+                        "last_tx_hash": hc["last_tx_hash"],
+                        "confidence": 0.80,
+                        "note": "Tier-2 hotspot cache observed direct interaction with a known mixer contract; verify tx context.",
+                    })
+                elif hc["bridge_touch_count"] > 0:
+                    has_any_evidence = True
+                    observed_facts.append({
+                        "grade": "Grade-C",
+                        "type": "HOTSPOT_CACHE_RECENT_BRIDGE_TOUCH",
+                        "bridge_touch_count": hc["bridge_touch_count"],
+                        "last_seen_block": hc["last_seen_block"],
+                        "confidence": 0.85,
+                    })
 
         # Determine transparent risk level & action
         if not has_any_evidence:

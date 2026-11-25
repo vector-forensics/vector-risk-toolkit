@@ -17,10 +17,13 @@ import subprocess
 import sys
 import tempfile
 
+from auto_tracer.entity_cluster import cluster_entities_conservative, same_cluster
 from auto_tracer.label_store import VectorLabelStore
+from auto_tracer.label_sync import run_self_test as run_label_sync_self_test
 from auto_tracer.models import ZERO_ADDR, TransferEdge
 from auto_tracer.runner import compute_hop_map, run_b1_heur_v5
 from risk_api.engine import VectorRiskEngine
+from risk_api.stream_cache import HotspotCacheStore
 from team_triage.signals import evaluate_triage_snapshot
 
 
@@ -172,7 +175,28 @@ def main() -> None:
         assert v5_rows[1]["status"] == "kept" and v5_rows[1].get("exploit_mint_candidate") is True
         assert v5_rows[2]["status"] == "filtered" and v5_rows[2]["raw_tx_retained"] is True
 
-        print("ALL PUBLIC TOOLKIT CHECKS PASSED (B1-Heur-v5 + Risk API + Track B + MCP/x402)")
+        # 5. OFAC/Grade-B isolated label sync + conservative entity clustering + Tier-2 hotspot cache
+        assert run_label_sync_self_test()["self_test"] == "PASS"
+        cl = cluster_entities_conservative([
+            {"type": "contract_deploy", "tx_hash": "0x1", "from": seed, "contract_address": secondary},
+            {"type": "tx_call_and_sweep", "tx_hash": "0x2", "tx_initiator": seed, "from": "0x10ed43c718714eb63d5aa57b78b54704e256024e", "to": seed},
+        ])
+        assert same_cluster(cl, seed, secondary) is True
+        assert same_cluster(cl, seed, "0x10ed43c718714eb63d5aa57b78b54704e256024e") is False
+
+        cache_db = os.path.join(tmp_dir, "cache.sqlite")
+        hc = HotspotCacheStore(cache_db)
+        try:
+            hc.ingest_edges("bsc", [{
+                "tx_hash": "0xmix", "block_number": 100, "log_index": -1,
+                "from_addr": seed, "to_addr": "0x0d5550d52428e7e3175bfc9550207e4ad3859b17",
+                "asset": "bnb", "symbol": "BNB", "amount_raw": str(10**18),
+            }], max_block=100, source_label="ci_test")
+            assert hc.lookup_address("bsc", seed)["mixer_touch_count"] == 1
+        finally:
+            hc.close()
+
+        print("ALL PUBLIC TOOLKIT CHECKS PASSED (B1-Heur-v5 + Sync + Clustering + StreamCache + Risk API + Track B + MCP/x402)")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
